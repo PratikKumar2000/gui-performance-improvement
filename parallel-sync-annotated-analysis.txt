@@ -1,0 +1,933 @@
+PARALLEL PSTO_MASTER_BF WRAPPER — ANNOTATED RETROSPECTIVE ANALYSIS
+==================================================================
+
+Plain-text retrospective for the parallel sync engagement over Oracle PL/SQL
+procedure PSTO_MASTER_BF. Sources: PSTO_MASTER_PARALLEL_API.sql,
+09_create_parallel_sync_api.sql, parallel-sync-integration.md, and
+GlobalEditWorkerTask.java (findAlternativeIds verification only).
+
+Generated: 2026-08-28
+
+
+PART 1 — WHAT WAS BUILT
+-----------------------
+
+Inventory
+
+  Procedures (PSTO_MASTER_PARALLEL_API.sql):
+    PSTO_MASTER_PARALLEL_WRK     Worker; one chunk range, own session/transaction
+    PSTO_MASTER_PARALLEL_BF    Orchestrator; STO_OBJ_ID_TAB input
+    PSTO_MASTER_PARALLEL_BF_STR  Same orchestrator; delimited CLOB for JDBC
+
+  DDL objects (09_create_parallel_sync_api.sql):
+    STO_OBJ_ID_TAB               TABLE OF VARCHAR2(50) for caller id collections
+    SEQ_PSTO_SYNC_RUN            Run identifier sequence
+    PSTO_SYNC_WORK               Per-run work queue and per-id result channel
+    FSTO_PSTO_PARENT_ID          Resolves immediate sync parent for cells/sectors
+
+  Test harness scripts (SyncRegression/):
+    PSTO_PARALLEL_STRESS_TEST.sql
+        Folding, hierarchy order, cross-technology bucketing, malformed input,
+        chunk balance; dry run only, does not mutate Atoll.
+    PSTO_PARALLEL_SCALING_TEST.sql
+        Per-object cost and speedup, 100-20,000 ids, levels 1-8; Update only,
+        real writes at ver_nr=0 but measured as scaling, not functional stress.
+    PSTO_PARALLEL_DELETE_TEST.sql
+        Cross-chunk separation contention in Delete mode; snapshot/restore.
+    PSTO_PARALLEL_CONCURRENT_TEST.sql
+        Two overlapping runs: same ids, disjoint ids at shared sites, concurrent
+        Delete; Update paths do not permanently mutate, Delete uses restore.
+    PSTO_PARALLEL_TEST_SNAPSHOT.sql
+        Snapshot and restore tooling shared by destructive tests.
+    PSTO_PARALLEL_LOCK_MONITOR.sql
+        Per-run diagnostics and wait-event reporting when V$ views are granted.
+
+  Problem replaced
+
+    Call sites previously looped PSTO_MASTER_BF once per object id. A bulk caller
+    therefore paid N round trips (or N in-database calls in a PL/SQL loop) and
+    could see only the last outcome: PSTO_MASTER_BF exposes a single V_RCODE /
+    V_MESSAGE OUT pair, so id 3 of 8,000 failing and id 8,000 succeeding left the
+    caller believing the whole batch succeeded. The wrapper stages every supplied
+    id in PSTO_SYNC_WORK keyed by RUN_ID, runs work with optional parallelism,
+    and returns aggregate OUT parameters while preserving one auditable row per
+    SRC_OBJ_ID.
+
+  Design rationale captured in API header (lines 1-136)
+
+    The header documents measured scaling, CSV-path prohibition, transaction-semantics
+    change, KDT partitioning for SITES check-then-act, ~3 s startup threshold math,
+    three-phase chunk model, XB fold semantics, CR/LF skip policy, and per-id results
+    query pattern. Those themes are woven through Parts 2-5 below rather than copied
+    verbatim.
+
+
+PART 2 — ANNOTATED WALKTHROUGH: THE SUPPORTING DDL
+--------------------------------------------------
+
+File: metadata/09_create_parallel_sync_api.sql
+
+[lines 1-19]  Header comment block
+    DOES:   States idempotent deploy order, target schemas (STOSM_O, STO1M_O,
+            STO2M_O, STOCM_O), and that the TYPE grant enables JDBC
+            createOracleArray.
+    BULK:   Documents why the collection type must be granted to the app user,
+            not just the procedures — without EXECUTE ON TYPE the GUI cannot bind
+            arrays even if it could unwrap OracleConnection.
+
+[lines 27-28]  CREATE OR REPLACE TYPE STO_OBJ_ID_TAB AS TABLE OF VARCHAR2(50)
+    DOES:   Defines the nested table type passed as P_OBJ_IDS.
+    BULK:   Lets one call carry tens of thousands of ids without dynamic SQL or
+            repeated procedure invocation; the orchestrator unnests via
+            TABLE(l_ids) in the staging INSERT.
+
+[lines 33-43]  Idempotent SEQ_PSTO_SYNC_RUN creation
+    DOES:   Creates sequence START WITH 1 CACHE 20 only if missing.
+    BULK:   CACHE 20 reduces latch traffic when many GUI saves each allocate a
+            RUN_ID; safe re-run avoids duplicate-object errors on redeploy.
+
+[lines 46-61]  PSTO_SYNC_WORK design comment (INITRANS rationale)
+    DOES:   Explains queue doubles as result channel and why INITRANS 16 matters.
+    BULK:   One INSERT...SELECT creates contiguous row blocks; up to 8 workers
+            UPDATE...WHERE ROWID on those same blocks. Default INITRANS 1 exhausts
+            interested-transaction-list slots -> wait 'enq: TX - allocate ITL
+            entry' -> ORA-00060. Sixteen slots cover twice C_MAX_PARALLEL (8).
+
+[lines 62-72]  create_indexes procedure
+    DOES:   Creates three indexes on PSTO_SYNC_WORK with matching INITRANS 16.
+    BULK:   IDX_PSW_RUN_CHUNK supports worker fetch by run_id/chunk_no/status;
+            IDX_PSW_RUN_OBJ supports fold-outcome MERGE on obj_id; IDX_PSW_CREATED
+            supports retention DELETE by created_at without full table scan.
+
+[lines 74-101]  CREATE TABLE PSTO_SYNC_WORK (... INITRANS 16)
+    DOES:   Defines all queue/result columns and CK_PSW_STATUS check constraint.
+    BULK:   Column layout encodes the three-phase chunk model (-2,-1,0,>0), per-id
+            audit (SRC_OBJ_ID vs OBJ_ID), and worker lifecycle fields in one table
+            queryable by RUN_ID after the call returns.
+
+[lines 78-99]  PSTO_SYNC_WORK column-by-column semantics
+    RUN_ID         Partition key for one orchestrator invocation; all diagnostics
+                   filter here. BULK: isolates concurrent callers' queues.
+    CHUNK_NO       Routes row to serial pre (-1), parallel bucket (1..N), serial
+                   tail (0), or skip (-2). BULK: phase boundaries never crossed by
+                   one worker range call.
+    VER_NR         Passed through to PSTO_MASTER_BF unchanged per row.
+    SRC_OBJ_ID     Caller-supplied id before normalization. BULK: audit trail when
+                   XB fold changes OBJ_ID; GUI lists failures by what user selected.
+    OBJ_ID         Normalized id PSTO_MASTER_BF receives. BULK: dedupe and fold key.
+    TRIGGER_MODE   Single mode per batch (Insert/Update/Delete). BULK: one staging
+                   plan; GUI splits #/@ encoded multi-mode payloads before calling.
+    MODE_PRIORITY  1=Delete, 2=Insert/Update. BULK: worker ORDER BY ensures Delete
+                   wins over upsert on same normalized id within a bucket.
+    OBJ_LEVEL      0/1/2/3 hierarchy. BULK: in-chunk order after mode_priority.
+    NET_TYP        SUBSTR(obj_id,2,2) cache. BULK: avoids repeated SUBSTR in worker.
+    KDT_KEY        Location key with net type stripped. BULK: parallel safety grain.
+    PARENT_OBJ_ID  Written by FSTO_PSTO_PARENT_ID; unused downstream (Part 8).
+    STATUS         Pending->Running->terminal state machine per row.
+    SESSION_ID     Worker's Oracle SID when Running/done. BULK: proves fan-out.
+    ATTEMPTS       Retry count from worker loop. BULK: collision observability.
+    PRUNED_BY      Carrier obj_id for folded rows. BULK: explains Pruned audit rows.
+    RCODE/MESSAGE  Per-id PSTO_MASTER_BF outcome. BULK: replaces single OUT pair.
+    CREATED_AT     Housekeeping for Step 10 retention trim.
+    STARTED_AT/ENDED_AT  Per-object timing; not reliable alone for parallelism proof.
+
+[lines 99-100]  CK_PSW_STATUS on create
+    DOES:   Initial constraint allows Pending, Running, Success, Failed, Pruned,
+            Skipped (DryRun added later in section 3b).
+    BULK:   Illegal status would break worker UPDATE and summary counts silently.
+
+[lines 107-127]  Upgrade path: ALTER INITRANS + MOVE + index REBUILD
+    DOES:   Raises INITRANS on existing deployments and reformats all blocks.
+    BULK:   ALTER alone only affects newly formatted blocks; MOVE is required so
+            already-packed blocks from bulk INSERTs get 16 ITL slots — otherwise
+            production would still ITL-thrash after a metadata-only ALTER.
+
+[lines 141-154]  Add SESSION_ID column if absent
+    DOES:   Idempotent ALTER ADD SESSION_ID NUMBER.
+    BULK:   Enables post-hoc proof that workers ran in distinct sessions; without
+            it, ~1 ms/object serial work falsely looks parallel via overlapping
+            timestamps.
+
+[lines 165-178]  Add ATTEMPTS column if absent
+    DOES:   Idempotent ALTER ADD ATTEMPTS NUMBER(2).
+    BULK:   Makes retry-visible: ATTEMPTS=2 on success proves a collision was
+            healed; essential for validating cross-run site-row races at scale.
+
+[lines 189-206]  CK_PSW_STATUS drop/recreate for DryRun status
+    DOES:   Unconditionally drops CK_PSW_STATUS (ignore ORA-2443) and recreates
+            including 'DryRun'.
+    BULK:   On 11.2 SEARCH_CONDITION is LONG and cannot be queried to see if
+            DryRun is already allowed — blind recreate is the safe idempotent
+            path; DryRun status separates plan validation from Skipped (undispatch).
+
+[lines 209-217]  COMMENT ON TABLE/COLUMN
+    DOES:   Documents chunk_no semantics, mode_priority, obj_level, kdt_key, etc.
+    BULK:   Operational runbooks can interpret PSTO_SYNC_WORK without re-reading
+            PL/SQL; note PARENT_OBJ_ID has no COMMENT ON COLUMN (see Part 8).
+
+[lines 226-263]  FSTO_PSTO_PARENT_ID function
+    DOES:   For 17-char sectors: pure CASE/SUBSTR net-type mapping to site alt id.
+            For 10-char cells: SELECT parent sector from STOZELG/STOZELXG/STOZELL.
+    BULK:   Intended for ancestor-aware ordering; currently only written, never
+            read (Part 8). Per 10-char cell: one index lookup per staging row when
+            obj_level=3 — serial cost on caller session before COMMIT releases
+            workers.
+
+[lines 235-242]  FSTO_PSTO_PARENT_ID sector branch (V_LEN=17)
+    DOES:   Maps XV->XL, XJ/XI->XI, XB/XF->XL suffix patterns; else SUBSTR 1..9.
+    BULK:   Pure SQL-free derivation — no staging penalty for 17-char sector ids.
+
+[lines 244-259]  FSTO_PSTO_PARENT_ID cell branch (V_LEN=10)
+    DOES:   SELECT SEKG/SEKXG/SEKL parent from STOZELG/XG/L by net type and V char.
+    BULK:   One indexed lookup per cell row when staging guard fires (obj_level 3).
+
+[lines 256-259]  EXCEPTION NO_DATA_FOUND / TOO_MANY_ROWS -> NULL parent
+    DOES:   Missing or ambiguous parent does not abort staging INSERT.
+    BULK:   Bad STOV reference still queues row; PSTO_MASTER_BF fails that id alone.
+
+[lines 274-304]  Grants to STOV_HOTLINE_* app user
+    DOES:   EXECUTE on TYPE, SELECT on PSTO_SYNC_WORK, synonyms for both.
+    BULK:   GUI user can createOracleArray('STO_OBJ_ID_TAB',...) and query failures
+            by RUN_ID without DBA intervention per schema.
+
+
+PART 3 — ANNOTATED WALKTHROUGH: THE WORKER
+------------------------------------------
+
+File: SyncRegression/PSTO_MASTER_PARALLEL_API.sql, PSTO_MASTER_PARALLEL_WRK
+
+[lines 144-148]  PROCEDURE signature (P_RUN_ID, P_START_ID, P_END_ID)
+    DOES:   Names the chunk range this slave executes; range is inclusive on
+            chunk_no.
+    BULK:   Same procedure serves serial pre-phase (-1,-1), parallel buckets
+            (1..N), serial tail (0,0), full parallel sweep (1..9999), and recovery
+            sweep — one code path, no duplicated PSTO_MASTER_BF loop logic.
+
+[lines 150-154]  Comment: read work list up front, not open cursor
+    DOES:   Design note for maintainers.
+    BULK:   States the ORA-01555 motivation explicitly: per-object COMMIT below
+            would invalidate a cursor re-reading PSTO_SYNC_WORK while updating it.
+
+[lines 155-161]  TYPE t_item / t_items nested table of records
+    DOES:   Holds ROWID, ver_nr, obj_id, trigger_mode per queued object.
+    BULK:   ROWID-targeted UPDATE avoids re-scanning by primary key ambiguity and
+            keeps updates pinned to the row fetched in the bulk collect.
+
+[lines 163-169]  Local variables including V_STATUS VARCHAR2 not BOOLEAN
+    DOES:   Declares scratch for PSTO_MASTER_BF OUT params and attempt loop.
+    BULK:   VARCHAR2 STATUS binds into SQL UPDATE — SQL has no BOOLEAN; using
+            BOOLEAN here would force conversion bugs in the hot update path.
+
+[lines 171]  C_MAX_ATTEMPT CONSTANT := 2
+    DOES:   At most one retry after first failure (two total attempts).
+    BULK:   Bounds retry storm on permanently broken ids (e.g. ORA-20005 cells);
+            verified deterministic failures end ATTEMPTS=2 and status Failed.
+
+[lines 173-179]  SELECT ... BULK COLLECT INTO l_items ... ORDER BY mode_priority,
+                  obj_level, obj_id
+    DOES:   Reads entire chunk work list in one fetch, ordered Delete-before-upsert
+            then ancestor-before-descendant within chunk.
+    BULK:   Avoids cursor held across COMMITs; ordering prevents Delete losing to
+            a concurrent upsert on same normalized obj_id within one bucket.
+
+[lines 181]  FOR i IN 1 .. NVL(l_items.COUNT, 0) LOOP
+    DOES:   Iterates collected items; NVL handles empty chunk gracefully.
+    BULK:   Empty parallel chunk is a no-op, not an error — important when bucket
+            count exceeds distinct pending chunks after folds/skips.
+
+[lines 183-187]  Comment on SESSION_ID as fan-out evidence
+    DOES:   Documents why started_at overlap is insufficient proof of parallelism.
+    BULK:   At ~1 ms/object serial chunks finish within one timestamp millisecond;
+            USER_PARALLEL_EXECUTE_CHUNKS is dropped with the task after RUN_TASK.
+
+[lines 188-192]  UPDATE ... SET status='Running', started_at, session_id=SID
+                  WHERE ROWID = l_items(i).rid
+    DOES:   Marks row in-flight and stamps Oracle session id.
+    BULK:   Distinguishes true multi-session runs in PSTO_SYNC_WORK for ops and
+            regression analysis; ROWID update is single-row, minimal ITL hold time.
+
+[lines 194-199]  V_ATTEMPT := 0; LOOP; increment; reset OUT params; V_STATUS :=
+                  'Success'
+    DOES:   Enters retry loop with clean success assumption each attempt.
+    BULK:   Retry loop is per object, not per chunk — one collision does not abort
+            siblings already committed in this worker.
+
+[lines 201-206]  PSTO_MASTER_BF(...) call
+    DOES:   Delegates one normalized id to existing sync stack.
+    BULK:   Single-id dispatch avoids PSTO_MASTER_BF CSV path bugs (mixed LTE/5G
+            routing on V_NET_TYP vs V_NET_TY; duplicated RR branch — see Part 7).
+
+[lines 208-215]  IF NVL(V_RCODE,-1) <> 0 THEN Failed
+    DOES:   Treats non-zero return as failure even when no exception raised.
+    BULK:   PSTO_MASTER_BF logs some errors to SYNC_FAILED, COMMITs, and returns
+            normally — without this check bulk runs would mark those rows Success.
+
+[lines 216]  EXIT on success path
+    DOES:   Leaves retry loop after good return.
+    BULK:   Prevents double sync on success — idempotency relies on one successful
+            PSTO_MASTER_BF completion per queued row.
+
+[lines 218-220]  WHEN OTHERS entry (comment block lines 220-256 in source)
+    DOES:   Documents why ORA-00060 branch was removed; cites 185 failures all
+            rcode -20002; explains SUBSTR(SQLERRM) nesting truncates ORA numbers.
+    BULK:   Informs maintainers not to reintroduce message-pattern deadlock detect.
+
+[lines 257-259]  V_RCODE := SQLCODE; V_MESSAGE := SUBSTR(SQLERRM,1,4000); Failed
+    DOES:   Records exception on work row before retry decision.
+    BULK:   Failed row retains SQLCODE for PSTO_SYNC_WORK forensics even if retry
+            later succeeds (ATTEMPTS=2, status Success).
+
+[lines 261-263]  IF V_ATTEMPT >= C_MAX_ATTEMPT THEN EXIT
+    DOES:   Second failure exits retry loop with Failed status.
+    BULK:   Prevents infinite retry on permanent defects (ORA-20005 xgcarriers cells).
+
+[lines 264]  END inner BEGIN/EXCEPTION; END LOOP retry
+    DOES:   Closes one attempt; loops for second attempt on any first failure.
+    BULK:   Single retry covers deadlocks, ORA-00001 site PK, transient locks — not
+            only ORA-00060 which never surfaces through PSTO_MASTER_BF wrapper.
+
+[lines 267-273]  Final UPDATE status/rcode/message/attempts/ended_at; COMMIT
+    DOES:   Persists per-id outcome and commits one object at a time.
+    BULK:   Mid-chunk failure does not roll back prior objects already pushed to
+            Atoll; matches non-transactional success semantics of PSTO_MASTER_BF and
+            bounds undo scope to one id.
+
+[lines 277]  COMMIT per object (comment)
+    DOES:   Documents intentional transaction grain change vs monolithic caller txn.
+    BULK:   Long bulk jobs survive partial progress; worker death loses at most the
+            in-flight object, not the whole chunk.
+
+
+PART 4 — ANNOTATED WALKTHROUGH: THE ORCHESTRATOR (STEPS 0-10)
+--------------------------------------------------------------
+
+File: SyncRegression/PSTO_MASTER_PARALLEL_API.sql, PSTO_MASTER_PARALLEL_BF
+
+[lines 287-301]  Procedure signature and P_DRY_RUN parameter placement
+    DOES:   IN params for ver, ids, mode, parallel level; OUT run_id, failed count,
+            rcode, message; P_DRY_RUN appended last for positional backward compat.
+    BULK:   Default P_DRY_RUN=0 preserves existing call sites; non-zero enables
+            production-scale plan validation without Atoll writes.
+
+[lines 303-305]  C_UNASSIGNED=9999, C_MAX_PARALLEL=8, C_RETAIN_DAYS=7
+    DOES:   Magic chunk placeholder, parallelism cap, housekeeping horizon.
+    BULK:   9999 is outside all real chunk ranges so MERGE can find unstaged keys;
+            cap 8 matches INITRANS 16 headroom; retention prevents unbounded queue
+            growth from GUI single-id saves each inserting one row.
+
+[lines 307-318]  C_STARTUP_MS=3000, C_MS_PER_OBJ=1.2 with correction comment
+    DOES:   Serial-vs-parallel break-even inputs measured on this database.
+    BULK:   Wrong C_MS_PER_OBJ=80 made batches of 500-2000 go parallel and run
+            slower (0.15x, 0.54x); corrected constant forces serial until ~2858
+            ids at level 8 (CEIL(3000/(1.2*(1-1/8)))).
+
+[lines 320-321]  l_ids := NVL(P_OBJ_IDS, STO_OBJ_ID_TAB())
+    DOES:   Null-safe empty collection instead of NULL dereference in TABLE().
+    BULK:   Defensive for JDBC callers; pairs with l_supplied=0 early return.
+
+[lines 329]  l_level := LEAST(GREATEST(NVL(P_PARALLEL_LVL,4),1), C_MAX_PARALLEL)
+    DOES:   Clamps parallel level to 1..8 with default 4.
+    BULK:   Prevents RUN_TASK parallel_level 0 or 99 from undefined scheduler behaviour;
+            aligns with INITRANS 16 = 2 * max workers design point.
+
+[lines 327]  l_in_job := SYS_CONTEXT('USERENV','BG_JOB_ID') IS NOT NULL
+    DOES:   Detects Oracle scheduler job session.
+    BULK:   Forces serial path — DBMS_PARALLEL_EXECUTE cannot nest inside job slaves.
+
+[lines 330-339]  Counter locals l_supplied through l_success
+    DOES:   Hold staging counts and final success tally for summary OUT params.
+    BULK:   Avoids re-querying PSTO_SYNC_WORK for fold/skip counts already known.
+
+[lines 341-348]  drop_task_if_exists procedure
+    DOES:   DROP_TASK with swallow-all exception handler.
+    BULK:   Crash mid-run can leave task; stale task name would block CREATE_TASK on
+            retry — drop is best-effort, never aborts the orchestrator.
+
+[lines 350-354]  Initialize OUT params and count supplied ids
+    DOES:   P_RCODE=0, P_MESSAGE='Success', count collection.
+    BULK:   'Success' literal preserved for existing callers using substring test.
+
+[lines 356-358]  SEQ_PSTO_SYNC_RUN.NEXTVAL; task name PSTO_MASTER_PARALLEL_<id>
+    DOES:   Allocates globally unique RUN_ID and parallel task name.
+    BULK:   RUN_ID is the caller's handle for PSTO_SYNC_WORK per-id results; task
+            name embeds run id to avoid collision between concurrent orchestrators.
+
+[lines 360-362]  DBMS_OUTPUT run banner
+    DOES:   Traces run id, ver, mode, id count in regression scripts.
+    BULK:   No performance impact in production if serveroutput off; essential for
+            harness post-mortem on 20k-id runs.
+
+--- STEP 0: Validate trigger mode before commit ---
+
+[lines 364-374]  IF P_TRIGGERMODE NOT IN ('Insert','Update','Delete') THEN rcode 999
+                  RETURN
+    DOES:   Rejects bad mode without staging, commit, or job start.
+    BULK:   PSTO_MASTER_BF returns 999 for invalid mode after work begins — failing
+            early avoids committing caller txn and launching ~3 s parallel startup
+            only to fail on first object.
+
+[lines 376-379]  IF l_supplied = 0 THEN RETURN
+    DOES:   Empty collection is success with no work.
+    BULK:   Lets blanket wrapper replace loop without caller empty-check branches.
+
+--- STEP 1: Stage, normalize, classify, fold ---
+
+[lines 384-387]  INSERT INTO PSTO_SYNC_WORK (...) column list includes parent_obj_id
+    DOES:   Begins set-based staging of all supplied ids for this RUN_ID.
+    BULK:   One INSERT...SELECT scales to tens of thousands of ids vs N inserts;
+            parent_obj_id populated here but never consumed (Part 8).
+
+[lines 388-392]  WITH src AS (SELECT DISTINCT TRIM(column_value) ...)
+    DOES:   Dedupes caller input, drops null/blank tokens.
+    BULK:   DISTINCT prevents duplicate PSTO_MASTER_BF calls for identical strings;
+            TRIM only — does not strip embedded control chars (see norm CTE).
+
+[lines 393-406]  norm CTE: XB fold to 10 chars; CR/LF skip_reason
+    DOES:   Normalizes XB TRX tracker keys <ZEL_10>_<TXT_ID> to 10-char cell id;
+            flags ids containing CHR(13) or CHR(10). Gated on THREE tests:
+            LENGTH > 10, net type XB, and an underscore at position 11.
+    BULK:   One cell sync covers all four TRGs via the STOTRGG loop inside
+            PSTO_STOZELG_BF (the 10-char GSM cell BF, which calls PSTO_STOTRGG_BF
+            per TXT_ID — B, T1, T2, Cell_Parameter), so folding 4:1 cuts calls.
+            CR/LF ids are Skipped not silently trimmed, because trimming would
+            sync a different object than caller named.
+    DEFECT FIXED (2026-08-31): the third test did not exist. A 17-char GSM sector
+            id passes the first two — it is longer than 10 and its net type is XB —
+            so every GSM sector was truncated to its first 10 characters. That is
+            NOT its cell. Sector BXB0001aaS001_018 owns cell BXB0001aaA: position
+            10 is 'S' on every one of 254,768 sectors but a per-cell letter on the
+            cell, and 0 of 244,266 cells equal their sector truncated to 10 chars.
+            Worse, all four sectors of a site truncate to the same 'BXB0001aaS',
+            so dup_rank folded them 4:1 onto one non-existent cell: three rows
+            Pruned, one call against a cell that does not exist, and the sectors
+            silently never synced. Blast radius was XB only: 244,266 of the 692,549
+            sectors at ver_nr 0. LTE/5G (XL 423,732 / XI 12,477 / XV 1,494 / XJ 78)
+            and even GSM repeaters (XF 10,502) never matched the XB test, which is
+            why earlier dry runs still showed level-2 sectors classifying correctly.
+            A sector's cell is not derivable from its id by any string operation.
+            The first 9 characters agree (site alternative) but position 10 is 'S'
+            on the sector and a cell letter on the cell, so the cell id is not even
+            a prefix. The relation happens to be 1:1 for GSM (244,266 each), which
+            does not make it computable — the only route is STOZELG.SEKG_SEK_ID.
+
+[lines 407-419]  cls CTE: obj_level from LENGTH; dup_rank ROW_NUMBER PARTITION BY obj_id
+    DOES:   Classifies 6/7->0 global, 9->1 site, 17->2 sector, 10->3 cell;
+            ranks duplicates after normalization.
+    BULK:   obj_level drives chunk_no assignment and in-chunk ordering (ancestors
+            lower level number processed before descendants when modes equal).
+
+[lines 421-427]  chunk_no CASE expression
+    DOES:   -2 if skip_reason or null obj_level; -1 if obj_level 0; 0 if MR/RR net
+            typ; else C_UNASSIGNED (9999) pending bucketing.
+    BULK:   Assigns serial phases before parallel MERGE; MR/RR never get kdt bucket.
+
+[lines 428-431]  P_VER_NR, src_obj_id, obj_id, P_TRIGGERMODE passthrough
+    DOES:   Binds run context and preserves both raw and normalized ids.
+    BULK:   Single INSERT projects all rows for RUN_ID in one pass.
+
+[lines 432]  mode_priority CASE Delete=1 else 2
+    DOES:   Encodes trigger mode as numeric sort key for worker ORDER BY.
+    BULK:   Delete-before-upsert prevents stale Atoll row surviving Delete batch.
+
+[lines 433-434]  NVL(c.obj_level,0) and SUBSTR net_typ
+    DOES:   Default level for skipped rows; extract net type once.
+    BULK:   MR/RR detection at line 425 uses SUBSTR(obj_id,2,2) IN ('MR','RR').
+
+[lines 435-437]  kdt_key CASE LENGTH>=9 THEN SUBSTR(1,1)||SUBSTR(4,4)
+    DOES:   Builds technology-normalized location key (char 1 + chars 4-7 of id).
+    BULK:   Collapses XB/XL/XV/XI/XJ/XF variants of same site into one chunk key;
+            required because SITES race is on location not technology.
+
+[lines 438-440]  parent_obj_id FSTO call guarded by obj_level IN (2,3)
+    DOES:   Populates unused parent column for sectors and cells only.
+    BULK:   Dead work on cell batches; never runs for GUI 9-char alts (Part 8).
+
+[lines 441-452]  status and message CASE for Skipped, Pruned, Pending
+    DOES:   Terminal classification at insert time for undispatchable, duplicate,
+            and callable rows.
+    BULK:   Pruned rows skip PSTO_MASTER_BF entirely — fold savings immediate.
+
+[lines 453]  FROM cls c
+    DOES:   Closes INSERT...SELECT from classification CTE.
+    BULK:   Set-based staging — no row-by-row PL/SQL loop over caller ids.
+
+[lines 455-459]  UPDATE pruned_by = obj_id WHERE status = 'Pruned'
+    DOES:   Folded rows point at carrier obj_id, not ancestor id.
+    BULK:   PRUNED_BY documents which normalized id's PSTO_MASTER_BF call covers
+            this SRC_OBJ_ID for audit queries.
+
+[lines 461-474]  Count queued/skipped/folded; DBMS_OUTPUT
+    DOES:   Sets l_queued, l_skipped, l_folded for later summary and dry run msg.
+    BULK:   Operator sees fold/skip counts before ~3 s parallel investment.
+
+--- STEP 2: Pack whole KDT keys into buckets ---
+
+[lines 476-487]  Comment: key not id bucketing; NTILE wrong; measured 7-113 on 400 cells
+    DOES:   Documents SITES invariant and NTILE failure mode.
+    BULK:   NTILE puts N heaviest locations in bucket 1 (7 rows) while bucket 16
+            gets 113 — straggler worker and false "balanced chunk" metrics; round-
+            robin spreads heavy keys across workers.
+
+[lines 489-491]  COUNT(DISTINCT kdt_key) WHERE chunk_no = C_UNASSIGNED
+    DOES:   Counts parallel-phase locations after serial assignments.
+    BULK:   l_key_cnt drives bucket count formula — bucket count tracks locations
+            not raw id count (one site key may carry many technology variants).
+
+[lines 493]  l_buckets := GREATEST(1, LEAST(l_key_cnt, l_level * 4))
+    DOES:   Caps buckets at 4x parallel level, at least 1.
+    BULK:   Prevents 400 locations creating 400 DBMS_PARALLEL_EXECUTE chunks (~3 s
+            startup each chunk task overhead); aligns chunk count with worker count.
+
+[lines 495-510]  MERGE ... MOD(ROW_NUMBER() OVER (ORDER BY cnt DESC, kdt_key)-1,
+                  l_buckets)+1 ... WHERE chunk_no = C_UNASSIGNED
+    DOES:   Round-robin assigns bucket numbers 1..l_buckets to whole kdt_keys;
+            ON matches run_id+kdt_key; UPDATE sets chunk_no; filter chunk_no in
+            UPDATE not ON (ORA-38104).
+    BULK:   All ids sharing a location land same bucket — no concurrent PATOL_STO_
+            ALT_SYNC check-then-act on same SITES.NAME from one run. Heavy locations
+            spread across workers via DESC cnt ordering.
+
+[lines 512-519]  UPDATE chunk_no=0 for remaining C_UNASSIGNED (NULL kdt_key)
+    DOES:   Safety net sends unbucketable rows to serial tail with message.
+    BULK:   Prevents orphan rows outside all worker chunk ranges that would stay
+            Pending forever after parallel phase.
+
+[lines 521-522]  DBMS_OUTPUT locations and bucket count
+    DOES:   Logs l_key_cnt and l_buckets for harness assertions.
+    BULK:   Stress test verifies 400 ids / 119 locations -> 16 balanced buckets.
+
+--- STEP 3: Commit caller transaction ---
+
+[lines 524-528]  COMMIT
+    DOES:   Commits caller's STOV changes and persisted PSTO_SYNC_WORK queue.
+    BULK:   Worker sessions cannot read caller uncommitted rows — mandatory for
+            correctness. Accepted behaviour change: Atoll sync no longer in same
+            txn as STOV edit; PL/SQL cursor loops become per-batch commits; retries
+            must be idempotent. PSTO_MASTER_BF itself does not COMMIT on success
+            (only on failure paths at lines 148, 236, 244 of PSTO_MASTER_BF).
+
+--- STEP 3b: Dry run ---
+
+[lines 530-551]  IF P_DRY_RUN <> 0 THEN UPDATE Pending->DryRun; COMMIT; RETURN
+    DOES:   Persists plan with DryRun status and descriptive P_MESSAGE; no BF calls.
+    BULK:   Validates folding/bucketing against production data volumes without
+            Atoll writes — PSTO_PARALLEL_STRESS_TEST relies on this.
+
+[lines 554-556]  IF l_queued = 0 early finish branch entry
+    DOES:   Skips phases 4-7 when nothing dispatchable.
+    BULK:   All-skipped batch avoids ~3 s startup and serial phase calls.
+
+--- STEP 4: Serial pre-phase global config ---
+
+[lines 557-560]  PSTO_MASTER_PARALLEL_WRK(l_run_id, -1, -1)
+    DOES:   Runs chunk_no -1 rows (obj_level 0, id length 6/7) in caller session.
+    BULK:   Global config objects are serial by design — small count, must complete
+            before parallel location work; same worker code path as slaves.
+
+--- STEP 5: Parallel phase with serial threshold ---
+
+[lines 565-567]  COUNT DISTINCT chunk_no >= 1 Pending
+    DOES:   Determines how many parallel chunks exist after folds.
+    BULK:   l_chunk_cnt=0 skips DBMS_PARALLEL_EXECUTE entirely.
+
+[lines 569-577]  Serial why: level<=1; l_queued < l_min_par break-even; formula
+    DOES:   l_min_par := CEIL(C_STARTUP_MS / (C_MS_PER_OBJ * (1 - 1/l_level)))
+    BULK:   Prevents 100-id batch paying 3050 ms for 110 ms of work (0.04x);
+            2000-id batch at wrong threshold was 3440 ms parallel vs 1860 serial
+            before C_MS_PER_OBJ fix; now stays serial until ~2858 at level 8.
+
+[lines 579-582]  IF l_in_job THEN l_serial_why := scheduler job
+    DOES:   Forces in-session serial when BG_JOB_ID present.
+    BULK:   DBMS_PARALLEL_EXECUTE nesting prohibition; production shape is interactive
+            fan-out overlapping serial scheduled PSTO_DAILY_SYNC (T12 tests).
+
+[lines 584-586]  DBMS_OUTPUT parallel chunks and serial reason
+    DOES:   Logs decision for regression output.
+    BULK:   Explains to operator why 400-id run fanned out but 40-id did not.
+
+[lines 588-589]  IF l_chunk_cnt>0 AND l_serial_why: WRK(1, C_UNASSIGNED)
+    DOES:   Runs all parallel buckets serially in caller session.
+    BULK:   Same correctness, no ~3 s startup — optimal for sub-threshold batches.
+
+[lines 591-614]  ELSE parallel: CREATE_TASK, CREATE_CHUNKS_BY_SQL by_rowid FALSE,
+                  RUN_TASK parallel_level l_level
+    DOES:   Chunks from DISTINCT chunk_no pairs; SQL passes :start_id/:end_id to
+            worker; by_rowid FALSE chunks on logical chunk_no column not ROWID.
+    BULK:   Logical chunking keeps entire KDT bucket in one task — ROWID chunking
+            could split one location across slaves and revive SITES race. Task SQL
+            uses chunk_no as both start and end so each chunk is one bucket number.
+
+[lines 616-641]  Task status check; non-PROCESSED chunk loop; FINISHED drops task
+    DOES:   Surfaces slave failures; retains task on unclean finish for DBA inspect.
+    BULK:   Failed parallel phase sets P_RCODE=1 so caller knows aggregate failure
+            even if some rows succeeded before abort.
+
+[lines 626-634]  Loop non-PROCESSED chunks output
+    DOES:   Logs chunk_id, status, error_code, truncated error_message.
+    BULK:   Surfaces which parallel chunk failed without querying DBA views post-run.
+
+[lines 636-641]  IF l_task_status = 'FINISHED' drop else P_RCODE=1 retain task
+    DOES:   Clean tasks dropped; dirty tasks left for DBA inspection with message.
+    BULK:   Retained task prevents silent partial parallel completion reporting Success.
+
+--- STEP 6: Serial tail MR/RR ---
+
+[lines 644-647]  PSTO_MASTER_PARALLEL_WRK(l_run_id, 0, 0)
+    DOES:   Processes chunk_no 0 MR/RR cross-location objects serially.
+    BULK:   Cannot partition: 3029 STOALT.ALT_ALT_ID_MR links cross cell-compound
+            boundaries; PATOL_STO_ALT_SYNC does UPDATE SITES ... WHERE NAME IN
+            (unbounded subquery) — parallel would race unrelated locations.
+
+--- STEP 7: Sweep leftover Pending/Running ---
+
+[lines 649-666]  COUNT Pending/Running; reset Running->Pending; WRK(-1, C_UNASSIGNED)
+    DOES:   Recovers rows whose chunk never ran or worker died mid-object.
+    BULK:   Prevents silent "stuck Running" after slave kill or task abort; still
+            unverified under deliberate kill (Part 10).
+
+--- STEP 8: Fold-outcome MERGE ---
+
+[lines 669-689]  IF l_folded > 0 MERGE Pruned rows from carrier Success/Failed
+    DOES:   Copies status/rcode/message from normalized obj_id carrier to folded
+            SRC_OBJ_ID rows; ORA-38104 pattern (status filter in UPDATE).
+    BULK:   Every supplied id gets final auditable outcome — GUI sees four TRG keys
+            all Success when one cell call succeeded.
+
+--- STEP 9: Summary ---
+
+[lines 692-704]  Count success/failed; DBMS_OUTPUT; P_FAILED_CNT
+    DOES:   Aggregate counts for OUT parameters and logs.
+    BULK:   Caller gets failed count without scanning PSTO_SYNC_WORK manually.
+
+[lines 706-722]  IF failures: MIN(rcode); message with KEEP DENSE_RANK FIRST
+    DOES:   Sets P_RCODE from failures; pairs first failed src_obj_id with its own
+            message via DENSE_RANK FIRST ORDER BY src_obj_id — not two unrelated MINs.
+    BULK:   Mis-paired MIN(id)+MIN(message) would mislead ops on which object failed
+            in 8k batches; substring 'Success' avoided in failure messages.
+
+[lines 724-737]  ELSIF skipped and clean rcode: P_RCODE=1 with skip detail
+    DOES:   Treats undispatchable ids as batch-level failure signal.
+    BULK:   Prevents reporting Success when objects never reached Atoll — matches
+            PSTO_MASTER_BF raise behaviour for bad lengths.
+
+--- STEP 10: Retention trim ---
+
+[lines 739-749]  IF MOD(l_run_id, 50) = 0 DELETE old rows ROWNUM<=50000
+    DOES:   Every 50th run deletes finished rows older than 7 days; keeps Pending/
+            Running as crash evidence.
+    BULK:   GUI saves insert one row per run — without trim PSTO_SYNC_WORK grows
+            unbounded; 50-run cadence amortizes DELETE cost.
+
+[lines 752-758]  EXCEPTION WHEN OTHERS handler
+    DOES:   Sets OUT params from SQLCODE and re-raises.
+    BULK:   Caller sees orchestrator failure distinct from per-id Failed rows.
+
+
+PART 5 — ANNOTATED WALKTHROUGH: THE CLOB ENTRY POINT
+----------------------------------------------------
+
+[lines 764-775]  Header: separate name because standalone procedures cannot overload
+    DOES:   Explains JDBC motivation vs STO_OBJ_ID_TAB binding.
+    BULK:   GUI already has comma-separated objectIdBuilder — CLOB avoids JDO
+            connection unwrap to OracleConnection.createOracleArray.
+
+[lines 776-787]  PSTO_MASTER_PARALLEL_BF_STR signature
+    DOES:   P_OBJ_IDS CLOB, P_SEPARATOR default ',', same OUT params + P_DRY_RUN.
+    BULK:   setCharacterStream on CLOB bypasses 32k setString limit for huge edits.
+
+[lines 789-794]  Initialize empty STO_OBJ_ID_TAB and scan state
+    DOES:   l_len from DBMS_LOB.GETLENGTH; l_sep from P_SEPARATOR.
+    BULK:   Empty CLOB yields zero ids — orchestrator handles as empty batch.
+
+[lines 796-807]  WHILE l_from <= l_len: DBMS_LOB.INSTR; SUBSTR tokens
+    DOES:   l_at=0 takes remainder as final token; else SUBSTR between separators;
+            l_from advances past separator length (supports multi-char separator).
+    BULK:   Streaming parse avoids VARCHAR2 4000 limit on entire id list; global
+            edits exceeding setString 32k CLOB limit still tokenize correctly.
+
+[lines 803-805]  CASE WHEN l_at > l_from for empty between consecutive separators
+    DOES:   Skips zero-length tokens from ",," without inserting blank ids.
+    BULK:   Prevents spurious Pending rows that would call PSTO_MASTER_BF with ''.
+
+[lines 809-816]  TRIM token; EXTEND collection; SUBSTR(token,1,50)
+    DOES:   Blank-trim only; append non-null tokens capped at 50 chars.
+    BULK:   Does not strip CR/LF — orchestrator marks those Skipped with reason;
+            50-char cap matches PSTO_SYNC_WORK column width.
+
+[lines 819-827]  Delegate to PSTO_MASTER_PARALLEL_BF named parameters
+    DOES:   Single implementation path — no duplicated staging logic.
+    BULK:   CLOB and array entry points behave identically for same id set.
+
+[lines 833-864]  Grant/synonym block for STOV_HOTLINE_* on both procedures
+    DOES:   Derives app user STOV_HOTLINE_<schema suffix>; GRANT EXECUTE; CREATE
+            SYNONYM with exception handler for manual follow-up.
+    BULK:   GUI schema user invokes wrapper without definer-rights surprises; API
+            script re-grants after compile so permission survives object recreate.
+
+[lines 138-139]  SET SERVEROUTPUT ON; SET DEFINE OFF (API script preamble)
+    DOES:   Enables deploy script logging; disables ampersand substitution.
+    BULK:   Idempotent re-run visibility during multi-schema rollout (STOSM_O etc.).
+
+[lines 282]  SHOW ERRORS PROCEDURE PSTO_MASTER_PARALLEL_WRK
+[lines 762]  SHOW ERRORS PROCEDURE PSTO_MASTER_PARALLEL_BF
+[lines 831]  SHOW ERRORS PROCEDURE PSTO_MASTER_PARALLEL_BF_STR
+    DOES:   Compile-time error surfacing in SQL*Plus/SQL Developer deploy sessions.
+    BULK:   Prevents deploying INVALID parallel stack to production silently.
+
+
+PART 6 — WHAT WAS ACHIEVED, AS MEASURED
+---------------------------------------
+
+Scaling table (Update mode, LTE cells, ver_nr=0, ATOSM_O, PSTO_PARALLEL_SCALING_TEST)
+
+      ids        serial      level 8     speedup    sessions
+      ---        ------      -------     -------    --------
+      100         110 ms      3,050 ms    0.04x      1 (stayed serial)
+      500         460 ms      3,140 ms    0.15x      5
+    2,000       1,860 ms      3,440 ms    0.54x      7
+    5,000       5,910 ms      5,060 ms    1.17x      7
+   20,000      32,940 ms     23,990 ms    1.37x      7
+
+Headline conclusion
+
+  Even at 20,000 objects and 7 concurrent sessions the speedup is only 1.37x, not
+  7x. Measured serial cost is ~0.92-1.65 ms per 10-char LTE cell, not ~80 ms. At
+  ~1 ms per object the run is dominated by a shared resource rather than CPU, so
+  extra sessions mostly add contention rather than throughput.
+
+  Parallelism only pays above roughly 3,000 objects (break-even ~2,858 at level 8
+  with C_MS_PER_OBJ=1.2 and C_STARTUP_MS=3000). Below that threshold the wrapper
+  correctly stays serial. This wrapper is worth deploying for bulk interfaces
+  (imports, migrations, PSTO_DAILY_SYNC) and worth almost nothing for a single-
+  object GUI save.
+
+Fixed ~3 s slave startup (no-op PSTO_MASTER_BF, V_VER_NR=-1 short-circuit)
+
+      1 id,    16 buckets, level 4  ->  3,030 ms
+    400 ids,   16 buckets, level 4  ->  3,050 ms
+     60 ids,   60 buckets, level 4  ->  3,230 ms
+     60 ids,    4 buckets, level 1  ->     30 ms
+
+  Startup cost is independent of workload and chunk count until bucket count explodes
+  task creation; the serial threshold exists so ordinary saves do not pay 3 s.
+
+Contention (150 GSM cells with cross-KDT separations, serial vs level 8)
+
+      Measure                         Serial    Level 8
+      -------                         ------    -------
+      concurrent sessions               1         6
+      chunks                            1         32
+      separations split across chunks   n/a       154
+      Atoll rows destroyed              982       982
+      objects failed                     26        26
+      failures introduced by concurrency  n/a       0
+
+  Identical failure sets prove concurrency did not introduce new failures on this
+  path. Row-lock contention on GSEPARATIONS waits rather than deadlocks.
+
+C_MS_PER_OBJ calibration fix effect
+
+  At 2,000 cells level 8: 3,440 ms before fix (incorrectly parallel) vs 1,750 ms
+  after fix (correctly serial) — from integration doc after recalibration from 80
+  to 1.2 ms.
+
+T12 two concurrent runs (PSTO_PARALLEL_CONCURRENT_TEST.sql)
+
+  Run A inline (fans out); Run B scheduler job (serial by BG_JOB_ID design).
+
+  Scenario                    Update same ids   Update disjoint shared sites   Delete same ids
+  --------                    ---------------   --------------------------   ---------------
+  pool size                   4,000 GSM         6,000                        8,000
+  A / B sizes                 3000 L8 / 2500 job 3000 odd / 3000 even         6000 L8 / 6000 serial
+  A sessions / chunks         8 / 32            8 / 32                       8 / 32
+  ids in common               1,500             0                            4,000
+  site rows in common         all               1,785 of 2,183 (82%)         all
+  seconds overlapping         6.5               7.4                          8.5 of A's 8.6
+  objects failed              0                 0                            0
+  collisions healed by retry  0                 0                            0
+  duplicate site rows         0                 0                            0
+  Atoll rows lost restore     0                 0                            0 (39,543 destroyed, all restored)
+
+  Middle column is pure SITES check-then-act stress at shared sites with zero id
+  overlap. Delete column: second run finds transmitter already gone — tolerated.
+
+Other verified capabilities (integration doc)
+
+  - Objects compile VALID on STOSM_O
+  - Invalid trigger mode returns 999 without commit or jobs
+  - XB tracker keys fold 4:1 with inherited outcome
+  - 400 ids / 119 locations -> 16 balanced buckets (18-43 rows each), 400 successes
+  - Threshold: 1 id and 40 ids serial; 400 parallel
+  - P_DRY_RUN and SESSION_ID added for testability
+
+
+PART 7 — WHAT WAS FOUND AND FIXED ALONG THE WAY
+-----------------------------------------------
+
+C_MS_PER_OBJ recalibration (80 -> 1.2)
+
+  The estimate 80 ms/object implied break-even ~50 objects at level 4. Measured
+  serial cost from scaling test: 460 ms/500, 1860 ms/2000, 5910 ms/5000 -> ~1 ms
+  each. Wrong constant actively routed mid-sized batches parallel, producing 0.15x
+  at 500 objects and 0.54x at 2,000 before fix.
+
+NTILE replaced by round-robin MOD(ROW_NUMBER()...)
+
+  NTILE splits ordered keys into equal-sized groups, putting the N heaviest
+  locations in bucket 1. Measured on 400 cells: buckets 7 to 113 rows. Round-
+  robin on cnt DESC spreads load so workers finish together.
+
+Unreachable deadlock retry fixed
+
+  Worker had PRAGMA EXCEPTION_INIT(e_deadlock, -60) branch never firing because
+  PSTO_MASTER_BF wraps all errors as ORA-20002. All 185 recorded failures carry
+  rcode -20002, none -60. Message sniffing unreliable due to nested SUBSTR(SQLERRM,
+  1, 200) truncation. Fix: unconditional one retry on any error; ATTEMPTS column
+  exposes retries. Caveat unchanged: retry may re-run partial work — safe only
+  because BFs use COUNT(1) existence checks before INSERT.
+
+PSTO_MASTER_BF CSV batching path documented as unusable
+
+  Lines 169/172 dispatch 10-char cells on V_NET_TYP from whole string (line 26) not
+  V_NET_TY per token (line 153) — mixed LTE/5G batch misroutes. Lines 185/190
+  duplicate ELSIF V_NET_TY IN ('RR') making PSTO_STOREPR_BF unreachable. Wrapper
+  passes single ids only.
+
+SESSION_ID added as fan-out evidence
+
+  Overlapping timestamps insufficient at ~1 ms/object; USER_PARALLEL_EXECUTE_CHUNKS
+  dropped after task completes. Worker stamps SYS_CONTEXT('USERENV','SID').
+
+
+PART 8 — DEAD CODE AND CALIBRATION GAPS FOUND IN REVIEW
+-------------------------------------------------------
+
+(a) PSTO_SYNC_WORK.PARENT_OBJ_ID written, never read
+
+  Written: staging INSERT lines 438-440 in PSTO_MASTER_PARALLEL_API.sql
+           CASE WHEN c.skip_reason IS NULL AND c.obj_level IN (2,3)
+                THEN FSTO_PSTO_PARENT_ID(P_VER_NR, c.obj_id)
+
+  Not read in: PSTO_MASTER_PARALLEL_WRK, orchestrator summary, fold MERGE, or any
+  harness query in this codebase.
+
+  Leftover from ancestor-pruning in an earlier consolidated design (not present in
+  current single API file): child whose ancestor was also Pending in same run was
+  marked Pruned with PRUNED_BY set to ancestor id and re-queued if ancestor Failed.
+  Current code: PRUNED_BY only set to obj_id for XB fold duplicates (lines 455-459).
+
+  Column has no COMMENT ON COLUMN unlike siblings (09_create_parallel_sync_api.sql
+  documents other columns at lines 209-217 but not PARENT_OBJ_ID).
+
+  Bulk cost: for each 10-char cell (obj_level 3) FSTO_PSTO_PARENT_ID runs one
+  SELECT against STOZELG/STOZELXG/STOZELL — one PL/SQL/SQL context switch and index
+  lookup per row, serial on caller session inside staging INSERT before Step 3 COMMIT.
+  For 17-char sectors (obj_level 2) function is pure CASE/SUBSTR — no SQL.
+
+(b) Staging guard obj_level IN (2,3) never fires on Global Edit bulk path
+
+  Verified in GlobalEditWorkerTask.java:
+    findAlternativeIds (lines 448-505): cell-group branch SELECT s.ALT_ALT_ID (site
+    alternative, 9 chars, obj_level 1); non-cell branch SELECT a.ALT_ID (9 chars).
+    Alternative-tab path (lines 367-369): objectIdBuilder.append(alt.getId()) — also
+    a BaseAlternative id (9 chars), never a 10-char cell or 17-char sector.
+
+  Swing Global Edit does not send level 2 or 3 ids. Consistent with ~8,872 distinct
+  alternatives for ~35,000 cells (~4 cells per alternative). Conclusion: per-row
+  parent lookup never runs on GUI bulk path; it runs for callers passing sectors or
+  cells (e.g. SYNC_FAILED_DAILY nightly backlog). Dropping column is tidiness, not
+  GUI bottleneck removal.
+
+(c) Calibration gap: C_MS_PER_OBJ=1.2 measured on 10-char LTE cells only
+
+  GUI sends 9-char site alternatives; one site sync cascades through sectors and
+  cells beneath it. Integration doc early overhead table: ~260 ms for one real 9-char
+  site vs ~80 ms for one cell (pre-1.2-ms calibration era per-object table — the
+  scaling measurement later showed ~1 ms/cell for bulk Update runs, a different
+  measurement context).
+
+  One global constant stands in for workloads differing by roughly two orders of
+  magnitude in per-object cost. Currently fails safe for large site batches (sends
+  them parallel when over threshold). Any future threshold tuning should depend on
+  batch obj_level mix. No measurement of per-object cost for 9-char site batches
+  through this wrapper exists yet — stated as gap to close, not measured fact.
+
+
+PART 9 — PRE-EXISTING DEFECTS FOUND BUT DELIBERATELY NOT FIXED
+----------------------------------------------------------------
+
+All reproduce with plain single-session PSTO_MASTER_BF; unrelated to parallelism.
+
+1. PATOG_STOSTOG_BF ORA-01403 when separation partner not released to Atoll
+   SELECT 1 INTO with no NO_DATA_FOUND handler. ver_nr=0: 250 GSM cells of 11,016
+   STOSTOG rows affected cannot sync. Repro: PSTO_MASTER_BF(0,'BXB1111apB','Update').
+
+2. Bulk delete / re-sync asymmetry
+   PSTO_MASTER_BF walks STOSTOG on ZEL_ID_1 only; TD_GTRANSMITTERS deletes both
+   TX_ID and TX_ID_OTHER. Of 982 rows destroyed in separation delete test, re-sync
+   left 112 unrecoverable (108 GSEPARATIONS, 4 GTRGS); snapshot restore required.
+
+3. Four LTE cells ORA-20005 RECORD DOES NOT EXIST IN xgcarriers
+   From PSTO_STOZELL_BF in 20,000-cell batch; fail serially and in parallel.
+
+
+PART 10 — STILL UNVERIFIED
+--------------------------
+
+From integration doc:
+
+  - ITL pressure by wait event; INITRANS 16 on PSTO_SYNC_WORK written in DDL but
+    not yet applied on STOSM_O; no 'enq: TX - allocate ITL entry' measurement —
+    STOSM_O lacks V$SESSION, V$LOCK, V$ACTIVE_SESSION_HISTORY (ORA-00942).
+    PSTO_PARALLEL_LOCK_MONITOR.sql section G ready when granted.
+
+  - Worker kill and sweep recovery behaviour under deliberate slave termination.
+
+  - Nested scheduler-job serial fallback beyond BG_JOB_ID check (edge cases).
+
+  - MR/RR serial tail ordering under heavy parallel load preceding chunk 0.
+
+  - SITES check-then-act race when site row genuinely absent (0 of 242,272 GSM
+    cells currently lack site row — race needs concurrent new-site creation).
+    Artificial repro rejected: TD_SITES cascade too destructive.
+
+  - Two concurrent runs where BOTH fan out — scheduler forces B serial; needs two
+    interactive sessions; asymmetric 8 vs 1 tested as production shape.
+
+  - Neighbour write path PATOG/PATOL/PATOU_STO_NEIGH_SYNC live but neighbour tables
+    empty — never executed. TIA_XGCELLSLTE DISABLED on ATOSM_O; results may not
+    transfer to schemas where enabled.
+
+
+PART 11 — BOTTOM LINE FOR LARGE BULK PROCESSING
+-----------------------------------------------
+
+This engagement's durable wins are not raw speed. Capped at 1.37x at 20,000 ids,
+parallelism is a bulk-only tool above ~3,000 objects where ~3 s startup amortizes.
+
+What actually bought value: per-id result channel in PSTO_SYNC_WORK (every SRC_OBJ_ID
+auditable); correctness guards — KDT-key chunking preserving SITES invariant within a
+run, three-phase ordering (global serial, parallel locations, MR/RR tail), per-object
+COMMIT in workers, unconditional retry with ATTEMPTS visibility, INITRANS 16 on the
+queue; calibrated refusal to parallelize sub-threshold batches after C_MS_PER_OBJ fix.
+
+Raw parallel speedup is the least valuable deliverable because ~1 ms/cell work is
+shared-resource bound — extra sessions add contention more than throughput.
+
+For the GUI, the integration doc concluded that batching round trips was not worth
+pursuing, on the assumption of ~80 ms per cell in its overhead table. The scaling
+test later measured 0.92-1.65 ms per cell and C_MS_PER_OBJ was corrected from 80 to
+1.2 — removing the basis for that conclusion. When server-side work per object is
+around 1 ms, fixed per-call overhead stops being negligible in comparison and can
+plausibly dominate. Round-trip removal is therefore worth measuring, and is now a
+better candidate than adding sessions, given the 1.37x parallel ceiling at 20,000
+ids. That is a hypothesis, not a result, for two separate reasons: no measurement of
+per-call client-side overhead against this wrapper exists, and the recalibrated 1.2 ms
+is cell-calibrated while the Global Edit path sends 9-character site alternatives
+whose per-object cost is unmeasured and expected to be much higher because a site sync
+cascades downward.
+
+Next effort should close calibration by obj_level mix, consider removing dead
+PARENT_OBJ_ID staging cost on cell/sector caller paths, apply INITRANS 16 in production
+and measure ITL waits when V$ access exists, and retire single-id JDBC overload defects
+documented in integration doc when switching callers to PSTO_MASTER_PARALLEL_BF_STR.
